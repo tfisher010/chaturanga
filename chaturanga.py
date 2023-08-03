@@ -3,14 +3,19 @@ import json
 import numpy as np
 import pickle
 import random
-from sklearn.neural_network import MLPClassifier
+from tensorflow import keras 
+
+# this list specifies which element of the square array should be flagged for a given piece
+# negative pieces denote black, positive white, but the code is later reversed and the negative taken
+# in order to render positions strategically symmetric
+SQUARE_ENCODER = np.array([-6, -5, -4, -3, -2, -1, 1, 2, 3, 4, 5, 6])
 
 # helper param definitions
 symb_map_white = {chess.PIECE_SYMBOLS[piece]: piece for piece in chess.PIECE_TYPES}
 symb_map_black = {
     chess.PIECE_SYMBOLS[piece].upper(): -piece for piece in chess.PIECE_TYPES
 }
-str_int_pos_map = symb_map_white | symb_map_black
+str_int_pos_map = {**symb_map_white, **symb_map_black}
 
 int_str_pos_map = {v: k for k, v in str_int_pos_map.items() if type(v) != list}
 int_str_pos_map.update({0: " "})
@@ -42,22 +47,35 @@ def record_game():
         board.push(chosen_move)
 
     winner = board.outcome().winner
-    cleansed_winner = [winner == 0, winner is None, winner == 1]
+    # cleansed_winner = [winner == 0, winner is None, winner == 1]
+    if winner is not None:
+        return {"winner": winner, "positions": position_list}
+    
+    # draws aren't that interesting, we'll just drop them
+    return
 
-    return {"winner": cleansed_winner, "positions": position_list}
-
-
-def fen_to_ints(fen_str: str, flatten_output: bool = True):
+def fen_to_ints(fen_str: str, reverse: bool = False):
     fen_split = fen_str.split(" ")
     placement = fen_split[0]
     row_list = placement.split("/")
-    board_repr = np.array(
-        [flatten([str_int_pos_map.get(piece) for piece in row]) for row in row_list]
-    )
-    if flatten_output:
-        nx, ny = board_repr.shape
-        board_repr = board_repr.reshape((nx * ny))
-    return board_repr
+
+    board_repr = [
+        flatten([
+            str_int_pos_map.get(piece) for piece in row
+        ]) for row in row_list
+    ]
+
+    if reverse:
+        for row in board_repr:
+            row.reverse()
+            row *= 1
+
+    vector_repr = [
+        [val == SQUARE_ENCODER for val in row] for row in board_repr 
+        # val == SQUARE_ENCODER for row in board_repr for val in row
+    ]
+
+    return vector_repr
 
 
 def fill_row_empty_chars(row: str):
@@ -77,7 +95,7 @@ def ints_to_fen(int_list: list):
     return fen
 
 
-def preprocess_fen_str(fen_str: str):
+def preprocess_fen_str(fen_str: str, winner):
     """
     fen notation:
     0: placement data (str)
@@ -91,38 +109,28 @@ def preprocess_fen_str(fen_str: str):
     fen_split = fen_str.split(" ")
     placement = fen_split[0]
 
-    board_repr = fen_to_ints(placement)
+    # if active color is black, reverse the board
+    reverse = fen_split[1] != 'w'
+    board_repr = fen_to_ints(placement, reverse=reverse)
+    winner = np.flip(winner) if reverse else winner
+    # if reverse:
+        # winner.reverse()
 
-    fen_split[0] = board_repr
-
-    # active color
-    fen_split[1] = fen_split[1] == 'w'
-
-    # castling availability
-    fen_split[2] = [c in fen_split[2] for c in ["K", "Q", "k", "q"]]
-
-    # halfmove clock
-    fen_split[4] = float(fen_split[4])
-
-    # fullmove clock
-    fen_split[5] = float(fen_split[5])
-
-    # drop en passant square, i'm too dumb
-    del fen_split[3]
-
-    return fen_split
+    return board_repr, winner
 
 
 def preprocess_raw_game_data(game_data: dict):
+
+    # this maps raw fen position sets to outcomes
     position_winner_map = {
         position: game["winner"]
         for game in game_data.values()
         for position in game["positions"]
     }
 
-    # take first two (most essential) elements of fen decomposition: piece locations and current turn
+    # this converts raw fen to normalized numeric matrix
     Xy_pairs = [
-        (preprocess_fen_str(position), winner)
+        preprocess_fen_str(position, winner)
         for position, winner in position_winner_map.items()
     ]
 
@@ -132,6 +140,9 @@ def preprocess_raw_game_data(game_data: dict):
 def generate_data(num_games: int = 10):
     # raw data generation
     game_data = {i: record_game() for i in range(num_games)}
+
+    # drop draws
+    game_data = {k:v for k,v in game_data.items() if v is not None}
 
     with open("artifacts/game_data.json", "w") as f:
         json.dump(game_data, f)
@@ -143,24 +154,45 @@ def generate_data(num_games: int = 10):
 
 
 def train_model():
+
     with open("artifacts/prepped_game_data.pkl", "rb") as f:
         Xy_pairs = pickle.load(f)
 
-    X = [np.concatenate([x[0][0], [x[0][1]]]) for x in Xy_pairs]
-    y = [x[1] for x in Xy_pairs]
-    clf = MLPClassifier(
-        hidden_layer_sizes=(100,),
-        activation="relu",
-        solver="adam",
-        alpha=0.0001,
-        early_stopping=True,
-        random_state=1,
-        verbose=True,
-    )
-    clf.fit(X, y)
+    X = np.array([x[0] for x in Xy_pairs])
+    y = np.array([x[1] for x in Xy_pairs])
 
-    with open("artifacts/model.pkl", "wb") as f:
-        pickle.dump(clf, f)
+    keras.utils.set_random_seed(0)
+
+    model = keras.models.Sequential([
+        keras.layers.Dense(100, input_shape=(8, 8, 12)),
+        keras.layers.Conv2D(
+            filters=20,
+            kernel_size=2,
+            strides=(1, 1),
+            activation='relu',
+        ),
+        keras.layers.Dense(
+            10, 
+            activation='relu',
+        ),
+        keras.layers.Flatten(),
+        keras.layers.Dense(1, activation = 'sigmoid')
+    ])
+    model.compile(
+        optimizer=keras.optimizers.Adam(
+            learning_rate=0.01
+        ),
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
+    model.fit(
+        x=X,
+        y=y,
+        epochs=1,
+        validation_split=0.25
+    )
+
+    model.save('artifacts/model.keras')
 
 # e.g.,
 # from chaturanga import generate_data, train_model

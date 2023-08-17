@@ -10,9 +10,8 @@ While the most sophisticated engines use MCTS for move selection, I'm starting h
 
 *Example Usage*
 ```
-from chaturanga import generate_data, train_model
-generate_data(num_games=10_000)
-train_model()
+from engine_development import train_engine
+results = train_engine()
 ```
 
 Author: Ted Fisher
